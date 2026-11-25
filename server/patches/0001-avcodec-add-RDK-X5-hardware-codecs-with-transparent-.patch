@@ -1,0 +1,1730 @@
+From 501a5fcdc4c3ed8e48c52a6ba8a33e605bb84284 Mon Sep 17 00:00:00 2001
+From: "yaqiang.li" <yaqiang.li@d-robotics.cc>
+Date: Sun, 22 Nov 2026 11:44:34 +0800
+Subject: [PATCH] avcodec: add RDK X5 hardware codecs with transparent
+ libx264/libx265 and decoder fallback
+
+---
+ configure              |  11 +
+ libavcodec/Makefile    |   1 +
+ libavcodec/allcodecs.c |   9 +
+ libavcodec/libx264.c   |  66 ++++
+ libavcodec/libx265.c   |  62 ++++
+ libavcodec/x5dec.c     | 692 +++++++++++++++++++++++++++++++++++++++++
+ libavcodec/x5enc.c     | 622 ++++++++++++++++++++++++++++++++++++
+ libavcodec/x5enc.h     |  52 ++++
+ 8 files changed, 1515 insertions(+)
+ create mode 100644 libavcodec/x5dec.c
+ create mode 100644 libavcodec/x5enc.c
+ create mode 100644 libavcodec/x5enc.h
+
+diff --git a/configure b/configure
+index e1d81e7..c682973 100755
+--- a/configure
++++ b/configure
+@@ -358,6 +358,7 @@ External library support:
+   --enable-omx             enable OpenMAX IL code [no]
+   --enable-omx-rpi         enable OpenMAX IL code for Raspberry Pi [no]
+   --enable-rkmpp           enable Rockchip Media Process Platform code [no]
++  --enable-x5mm            enable RDK X5 hb_mm_mc hardware codec code [no]
+   --enable-rkrga           enable Rockchip 2D Raster Graphic Acceleration code [no]
+   --disable-v4l2-m2m       disable V4L2 mem2mem code [autodetect]
+   --disable-vaapi          disable Video Acceleration API (mainly Unix/Intel) code [autodetect]
+@@ -2030,6 +2031,7 @@ HWACCEL_LIBRARY_LIST="
+     omx
+     opencl
+     rkmpp
++    x5mm
+ "
+ 
+ DOCUMENT_LIST="
+@@ -3385,6 +3387,14 @@ h264_qsv_encoder_select="atsc_a53 qsvenc"
+ h264_rkmpp_decoder_deps="rkmpp"
+ h264_rkmpp_decoder_select="h264_mp4toannexb_bsf dump_extradata_bsf"
+ h264_rkmpp_encoder_deps="rkmpp"
++h264_x5_decoder_deps="x5mm"
++h264_x5_decoder_select="h264_mp4toannexb_bsf"
++h264_x5_encoder_deps="x5mm"
++hevc_x5_decoder_deps="x5mm"
++hevc_x5_decoder_select="hevc_mp4toannexb_bsf"
++hevc_x5_encoder_deps="x5mm"
++mjpeg_x5_decoder_deps="x5mm"
++mjpeg_x5_encoder_deps="x5mm"
+ h264_vaapi_encoder_select="atsc_a53 cbs_h264 vaapi_encode"
+ h264_vulkan_encoder_select="cbs_h264 vulkan_encode"
+ h264_v4l2m2m_decoder_deps="v4l2_m2m h264_v4l2_m2m"
+@@ -7199,6 +7209,7 @@ enabled openssl           && { { check_pkg_config openssl "openssl >= 3.0.0" ope
+                                check_lib openssl openssl/ssl.h SSL_library_init -lssl -lcrypto -lws2_32 -lgdi32 ||
+                                die "ERROR: openssl not found"; }
+ enabled pocketsphinx      && require_pkg_config pocketsphinx pocketsphinx pocketsphinx/pocketsphinx.h ps_init
++enabled x5mm              && require x5mm hb_media_codec.h hb_mm_mc_initialize -lmultimedia
+ enabled rkmpp             && { require_pkg_config rkmpp rockchip_mpp rockchip/rk_mpi.h mpp_create &&
+                                require_pkg_config rockchip_mpp "rockchip_mpp >= 1.3.9" rockchip/rk_mpi.h mpp_create &&
+                                { enabled libdrm ||
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 5e5cded..7cb90a9 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -431,6 +431,7 @@ OBJS-$(CONFIG_H264_QSV_DECODER)        += qsvdec.o
+ OBJS-$(CONFIG_H264_QSV_ENCODER)        += qsvenc_h264.o
+ OBJS-$(CONFIG_H264_RKMPP_DECODER)      += rkmppdec.o
+ OBJS-$(CONFIG_H264_RKMPP_ENCODER)      += rkmppenc.o
++OBJS-$(CONFIG_X5MM)                    += x5enc.o x5dec.o
+ OBJS-$(CONFIG_H264_VAAPI_ENCODER)      += vaapi_encode_h264.o h264_levels.o \
+                                           h2645data.o hw_base_encode_h264.o
+ OBJS-$(CONFIG_H264_VULKAN_ENCODER)     += vulkan_encode.o vulkan_encode_h264.o \
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index c9ffce4..b4b306b 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -147,6 +147,8 @@ extern const FFCodec ff_h263p_encoder;
+ extern const FFCodec ff_h263p_decoder;
+ extern const FFCodec ff_h263_v4l2m2m_decoder;
+ extern const FFCodec ff_h263_rkmpp_decoder;
++/* RDK X5: hardware first, falls back to the native decoder */
++extern const FFCodec ff_h264_x5_decoder;
+ extern const FFCodec ff_h264_decoder;
+ extern const FFCodec ff_h264_v4l2m2m_decoder;
+ extern const FFCodec ff_h264_mediacodec_decoder;
+@@ -156,6 +158,8 @@ extern const FFCodec ff_h264_qsv_decoder;
+ extern const FFCodec ff_h264_rkmpp_decoder;
+ extern const FFCodec ff_hap_encoder;
+ extern const FFCodec ff_hap_decoder;
++/* RDK X5: hardware first, falls back to the native decoder */
++extern const FFCodec ff_hevc_x5_decoder;
+ extern const FFCodec ff_hevc_decoder;
+ extern const FFCodec ff_hevc_qsv_decoder;
+ extern const FFCodec ff_hevc_rkmpp_decoder;
+@@ -195,6 +199,8 @@ extern const FFCodec ff_mdec_decoder;
+ extern const FFCodec ff_media100_decoder;
+ extern const FFCodec ff_mimic_decoder;
+ extern const FFCodec ff_mjpeg_encoder;
++/* RDK X5: hardware first, falls back to the native decoder */
++extern const FFCodec ff_mjpeg_x5_decoder;
+ extern const FFCodec ff_mjpeg_decoder;
+ extern const FFCodec ff_mjpegb_decoder;
+ extern const FFCodec ff_mmvideo_decoder;
+@@ -858,6 +864,9 @@ extern const FFCodec ff_h264_vaapi_encoder;
+ extern const FFCodec ff_h264_videotoolbox_encoder;
+ extern const FFCodec ff_h264_vulkan_encoder;
+ extern const FFCodec ff_h264_rkmpp_encoder;
++extern const FFCodec ff_h264_x5_encoder;
++extern const FFCodec ff_hevc_x5_encoder;
++extern const FFCodec ff_mjpeg_x5_encoder;
+ extern const FFCodec ff_hevc_amf_encoder;
+ extern const FFCodec ff_hevc_cuvid_decoder;
+ extern const FFCodec ff_hevc_d3d12va_encoder;
+diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
+index 409f45f..26d9f5f 100644
+--- a/libavcodec/libx264.c
++++ b/libavcodec/libx264.c
+@@ -40,6 +40,9 @@
+ #include "atsc_a53.h"
+ #include "sei.h"
+ #include "golomb.h"
++#if CONFIG_X5MM
++#include "x5enc.h"
++#endif
+ 
+ #include <x264.h>
+ #include <float.h>
+@@ -74,6 +77,9 @@ typedef struct X264Context {
+     char *tune;
+     const char *profile;
+     char *profile_opt;
++#if CONFIG_X5MM
++    struct X5Enc *x5;
++#endif
+     char *level;
+     int fastfirstpass;
+     char *wpredp;
+@@ -619,6 +625,10 @@ static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
+     int64_t wallclock = 0;
+     X264Opaque *out_opaque;
+ 
++#if CONFIG_X5MM
++    if (x4->x5)
++        return ff_x5enc_encode(ctx, x4->x5, pkt, frame, got_packet);
++#endif
+     ret = setup_frame(ctx, frame, &pic_in);
+     if (ret < 0)
+         return ret;
+@@ -748,6 +758,12 @@ static void X264_flush(AVCodecContext *avctx)
+     int nnal, ret;
+     x264_picture_t pic_out = {0};
+ 
++#if CONFIG_X5MM
++    /* the hardware path holds no frames */
++    if (x4->x5)
++        return;
++#endif
++
+     do {
+         ret = x264_encoder_encode(x4->enc, &nal, &nnal, NULL, &pic_out);
+     } while (ret > 0 && x264_encoder_delayed_frames(x4->enc));
+@@ -777,6 +793,9 @@ static av_cold int X264_close(AVCodecContext *avctx)
+         x264_encoder_close(x4->enc);
+         x4->enc = NULL;
+     }
++#if CONFIG_X5MM
++    ff_x5enc_close(&x4->x5);
++#endif
+ 
+     return 0;
+ }
+@@ -1062,6 +1081,49 @@ static void handle_side_data(AVCodecContext *avctx, x264_param_t *params)
+ #endif // CONFIG_LIBX264_HDR10
+ }
+ 
++#if CONFIG_X5MM
++/*
++ * RDK X5: take the hardware encoder when it can honour the request, so
++ * existing x264 users get it without changes. Lossless, non 4:2:0 and
++ * >8-bit input stay on x264. B frames, presets and x264-params are
++ * not available in hardware and are ignored. X5_CODEC_DISABLE=1 forces
++ * x264.
++ */
++static int x264_x5_open(AVCodecContext *avctx)
++{
++    X264Context *x = avctx->priv_data;
++    X5EncParams par = {
++        .qp      = -1,
++        .profile = avctx->profile,
++        .gop     = 250,
++    };
++    int ret;
++
++    if (x->cqp == 0 || x->crf == 0)
++        return AVERROR(ENOSYS);
++    if (avctx->bit_rate <= 0)
++        par.qp = av_clip(x->cqp >= 0 ? x->cqp :
++                         lrintf(x->crf >= 0 ? x->crf : 23), 1, 51);
++    if (x->profile_opt && par.profile == AV_PROFILE_UNKNOWN) {
++        if (!strcmp(x->profile_opt, "baseline"))
++            par.profile = AV_PROFILE_H264_BASELINE;
++        else if (!strcmp(x->profile_opt, "main"))
++            par.profile = AV_PROFILE_H264_MAIN;
++        else if (!strcmp(x->profile_opt, "high"))
++            par.profile = AV_PROFILE_H264_HIGH;
++    }
++    ret = ff_x5enc_open(avctx, &par, &x->x5);
++    if (!ret)
++        av_log(avctx, AV_LOG_INFO, "using RDK X5 hardware encoder; "
++               "x264 options are ignored (X5_CODEC_DISABLE=1 selects "
++               "x264)\n");
++    else if (ret != AVERROR(ENOSYS))
++        av_log(avctx, AV_LOG_VERBOSE, "RDK X5 hardware encoder unavailable, "
++               "using x264\n");
++    return ret;
++}
++#endif
++
+ static av_cold int X264_init(AVCodecContext *avctx)
+ {
+     X264Context *x4 = avctx->priv_data;
+@@ -1069,6 +1131,10 @@ static av_cold int X264_init(AVCodecContext *avctx)
+     int sw,sh;
+     int ret;
+ 
++#if CONFIG_X5MM
++    if (avctx->codec_id == AV_CODEC_ID_H264 && x264_x5_open(avctx) == 0)
++        return 0;
++#endif
+     if (avctx->global_quality > 0)
+         av_log(avctx, AV_LOG_WARNING, "-qscale is ignored, -crf is recommended.\n");
+ 
+diff --git a/libavcodec/libx265.c b/libavcodec/libx265.c
+index 63cc497..0d62bcb 100644
+--- a/libavcodec/libx265.c
++++ b/libavcodec/libx265.c
+@@ -38,6 +38,9 @@
+ #include "codec_internal.h"
+ #include "dovi_rpu.h"
+ #include "encode.h"
++#if CONFIG_X5MM
++#include "x5enc.h"
++#endif
+ #include "packet_internal.h"
+ #include "atsc_a53.h"
+ #include "sei.h"
+@@ -64,6 +67,9 @@ typedef struct libx265Context {
+     char *preset;
+     char *tune;
+     char *profile;
++#if CONFIG_X5MM
++    struct X5Enc *x5;
++#endif
+     AVDictionary *x265_opts;
+ 
+     void *sei_data;
+@@ -136,6 +142,11 @@ static av_cold int libx265_encode_close(AVCodecContext *avctx)
+ {
+     libx265Context *ctx = avctx->priv_data;
+ 
++#if CONFIG_X5MM
++    ff_x5enc_close(&ctx->x5);
++    if (!ctx->api)
++        return 0;
++#endif
+     ctx->api->param_free(ctx->params);
+     av_freep(&ctx->sei_data);
+ 
+@@ -243,6 +254,49 @@ static int handle_side_data(AVCodecContext *avctx, const x265_api *api,
+     return 0;
+ }
+ 
++#if CONFIG_X5MM
++/*
++ * RDK X5: take the hardware encoder when it can honour the request, so
++ * existing x265 users get it without changes. Lossless, non 4:2:0 and
++ * >8-bit input stay on x265. B frames, presets and x265-params are
++ * not available in hardware and are ignored. X5_CODEC_DISABLE=1 forces
++ * x265.
++ */
++static int x265_x5_open(AVCodecContext *avctx)
++{
++    libx265Context *x = avctx->priv_data;
++    X5EncParams par = {
++        .qp      = -1,
++        .profile = avctx->profile,
++        .gop     = 250,
++    };
++    int ret;
++
++    if (x->cqp == 0 || x->crf == 0)
++        return AVERROR(ENOSYS);
++    if (avctx->bit_rate <= 0)
++        par.qp = av_clip(x->cqp >= 0 ? x->cqp :
++                         lrintf(x->crf >= 0 ? x->crf : 28), 1, 51);
++    if (x->profile && par.profile == AV_PROFILE_UNKNOWN) {
++        if (!strcmp(x->profile, "baseline"))
++            par.profile = AV_PROFILE_H264_BASELINE;
++        else if (!strcmp(x->profile, "main"))
++            par.profile = AV_PROFILE_H264_MAIN;
++        else if (!strcmp(x->profile, "high"))
++            par.profile = AV_PROFILE_H264_HIGH;
++    }
++    ret = ff_x5enc_open(avctx, &par, &x->x5);
++    if (!ret)
++        av_log(avctx, AV_LOG_INFO, "using RDK X5 hardware encoder; "
++               "x265 options are ignored (X5_CODEC_DISABLE=1 selects "
++               "x265)\n");
++    else if (ret != AVERROR(ENOSYS))
++        av_log(avctx, AV_LOG_VERBOSE, "RDK X5 hardware encoder unavailable, "
++               "using x265\n");
++    return ret;
++}
++#endif
++
+ static av_cold int libx265_encode_init(AVCodecContext *avctx)
+ {
+     libx265Context *ctx = avctx->priv_data;
+@@ -250,6 +304,10 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
+     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
+     int ret;
+ 
++#if CONFIG_X5MM
++    if (x265_x5_open(avctx) == 0)
++        return 0;
++#endif
+     ctx->api = x265_api_get(desc->comp[0].depth);
+     if (!ctx->api)
+         ctx->api = x265_api_get(0);
+@@ -677,6 +735,10 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+     int ret;
+     int i;
+ 
++#if CONFIG_X5MM
++    if (ctx->x5)
++        return ff_x5enc_encode(avctx, ctx->x5, pkt, pic, got_packet);
++#endif
+     ctx->api->picture_init(ctx->params, &x265pic);
+ 
+     sei = &x265pic.userSEI;
+diff --git a/libavcodec/x5dec.c b/libavcodec/x5dec.c
+new file mode 100644
+index 0000000..f85a171
+--- /dev/null
++++ b/libavcodec/x5dec.c
+@@ -0,0 +1,692 @@
++/*
++ * RDK X5 hardware decoder (H.264/HEVC on VPU, MJPEG on JPU)
++ * through D-Robotics libmultimedia (hb_mm_mc_* API).
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <hb_media_codec.h>
++#include <hb_media_error.h>
++
++#include <stdlib.h>
++#include <string.h>
++
++#include "config_components.h"
++
++#include "libavutil/imgutils.h"
++#include "libavutil/mem.h"
++#include "avcodec.h"
++#include "bsf.h"
++#include "codec_internal.h"
++#include "decode.h"
++#include "internal.h"
++
++#define X5DEC_TIMEOUT_MS   5000
++#define X5DEC_MAX_PTS      64
++/* packets kept since the last keyframe, to replay into the fallback */
++#define X5DEC_MAX_REPLAY   600
++/* packets taken from libavcodec but not yet queued to the hardware */
++#define X5DEC_MAX_PENDING  32
++
++typedef struct X5DecContext {
++    const AVClass *class;
++    /* software fallback: set when the hardware cannot take the stream */
++    AVCodecContext *sw;
++    media_codec_context_t mc;
++    int started;
++    /*
++     * Packets are always taken from libavcodec right away, so its single
++     * packet slot is free and avcodec_send_packet() never returns EAGAIN
++     * (OpenCV, for one, drops the packet when it does).
++     */
++    AVPacket *pending[X5DEC_MAX_PENDING];
++    int nb_pending;
++    /*
++     * Like the native decoders, return at most one frame per packet taken
++     * (except while draining). Callers such as OpenCV 4.5 lose the pts of a
++     * frame that is ready before they send the next packet.
++     */
++    int may_output;
++    int eos_pending;    /* EOF taken from libavcodec, not yet queued */
++    int eos_sent;
++    int eos;
++    AVPacket *pkt;
++    /*
++     * The hardware tags each output frame with the pts of the packet
++     * decoded at that step (decode order), not of the displayed frame.
++     * Frames come out in display order, so the display pts is always
++     * the smallest pts still pending.
++     */
++    int64_t pts[X5DEC_MAX_PTS];
++    int64_t dur[X5DEC_MAX_PTS];  /* packet duration, for VFR streams */
++    int nb_pts;
++    /*
++     * Mid-stream fallback: the library may accept an instance and only fail
++     * later (e.g. out of ION memory with many instances). Keep the packets
++     * since the last keyframe, replay them into a software decoder and drop
++     * the frames that were already returned.
++     */
++    AVPacket *replay[X5DEC_MAX_REPLAY];
++    int nb_replay, replay_pos, replay_eos;
++    int64_t last_pts;
++    int64_t nb_out, nb_sent, sent_at_key, drop;
++} X5DecContext;
++
++static void x5dec_pending_reset(X5DecContext *s)
++{
++    while (s->nb_pending)
++        av_packet_free(&s->pending[--s->nb_pending]);
++}
++
++/* move the oldest pending packet into s->pkt */
++static void x5dec_pending_pop(X5DecContext *s)
++{
++    av_packet_move_ref(s->pkt, s->pending[0]);
++    av_packet_free(&s->pending[0]);
++    memmove(s->pending, s->pending + 1, --s->nb_pending * sizeof(*s->pending));
++}
++
++static void x5dec_replay_reset(X5DecContext *s)
++{
++    while (s->nb_replay)
++        av_packet_free(&s->replay[--s->nb_replay]);
++    s->replay_pos = 0;
++}
++
++static void x5dec_replay_add(X5DecContext *s, const AVPacket *pkt)
++{
++    if (pkt->flags & AV_PKT_FLAG_KEY) {
++        x5dec_replay_reset(s);
++        s->sent_at_key = s->nb_sent;
++    }
++    /* overflow: the fallback will resync at the next keyframe */
++    if (s->nb_replay < X5DEC_MAX_REPLAY)
++        s->replay[s->nb_replay++] = av_packet_clone(pkt);
++}
++
++static void x5dec_push_pts(X5DecContext *s, const AVPacket *pkt)
++{
++    if (pkt->pts == AV_NOPTS_VALUE || s->nb_pts == X5DEC_MAX_PTS)
++        return;
++    s->pts[s->nb_pts] = pkt->pts;
++    s->dur[s->nb_pts] = pkt->duration;
++    s->nb_pts++;
++}
++
++/* sets the pts and duration of the picture that is displayed next */
++static void x5dec_pop_pts(X5DecContext *s, AVFrame *frame)
++{
++    int i, min = 0;
++
++    if (!s->nb_pts) {
++        frame->pts = AV_NOPTS_VALUE;
++        return;
++    }
++    for (i = 1; i < s->nb_pts; i++)
++        if (s->pts[i] < s->pts[min])
++            min = i;
++    frame->pts      = s->pts[min];
++    frame->duration = s->dur[min];
++    s->nb_pts--;
++    s->pts[min] = s->pts[s->nb_pts];
++    s->dur[min] = s->dur[s->nb_pts];
++}
++
++static av_cold int x5dec_close(AVCodecContext *avctx)
++{
++    X5DecContext *s = avctx->priv_data;
++
++    if (s->started) {
++        hb_mm_mc_stop(&s->mc);
++        hb_mm_mc_release(&s->mc);
++        s->started = 0;
++    }
++    av_packet_free(&s->pkt);
++    avcodec_free_context(&s->sw);
++    x5dec_replay_reset(s);
++    x5dec_pending_reset(s);
++    return 0;
++}
++
++/* X5_CODEC_DISABLE=1 forces the software path, for comparison and debug */
++static int x5dec_disabled(void)
++{
++    const char *e = getenv("X5_CODEC_DISABLE");
++
++    return e && *e && strcmp(e, "0");
++}
++
++/* the VPU/JPU only do 8-bit 4:2:0; AV_PIX_FMT_NONE means not probed yet */
++static int x5dec_hw_usable(AVCodecContext *avctx)
++{
++    if (x5dec_disabled() || avctx->lowres)
++        return 0;
++    /*
++     * Keyframe-only decoding (e.g. thumbnails with -skip_frame nointra) is
++     * cheap on the CPU, while the hardware has to decode every frame.
++     */
++    if (avctx->skip_frame >= AVDISCARD_NONINTRA)
++        return 0;
++    return avctx->pix_fmt == AV_PIX_FMT_NONE ||
++           avctx->pix_fmt == AV_PIX_FMT_YUV420P ||
++           avctx->pix_fmt == AV_PIX_FMT_YUVJ420P;
++}
++
++static av_cold int x5dec_init_sw(AVCodecContext *avctx)
++{
++    X5DecContext *s = avctx->priv_data;
++    const char *name = avctx->codec_id == AV_CODEC_ID_H264 ? "h264" :
++                       avctx->codec_id == AV_CODEC_ID_HEVC ? "hevc" : "mjpeg";
++    const AVCodec *c = avcodec_find_decoder_by_name(name);
++    int ret;
++
++    if (!c)
++        return AVERROR_DECODER_NOT_FOUND;
++    s->sw = avcodec_alloc_context3(c);
++    if (!s->sw)
++        return AVERROR(ENOMEM);
++    /* packets arrive through our Annex B filter: take its output params */
++    ret = avcodec_parameters_to_context(s->sw, avctx->internal->bsf->par_out);
++    if (ret < 0)
++        return ret;
++    s->sw->pkt_timebase      = avctx->pkt_timebase;
++    s->sw->thread_count      = avctx->thread_count;
++    s->sw->thread_type       = avctx->thread_type;
++    s->sw->flags             = avctx->flags;
++    s->sw->flags2            = avctx->flags2;
++    s->sw->skip_frame        = avctx->skip_frame;
++    s->sw->skip_loop_filter  = avctx->skip_loop_filter;
++    s->sw->err_recognition   = avctx->err_recognition;
++    s->sw->workaround_bugs   = avctx->workaround_bugs;
++    s->sw->strict_std_compliance = avctx->strict_std_compliance;
++    return avcodec_open2(s->sw, c, NULL);
++}
++
++/*
++ * The decoder emits nothing until it holds a full DPB of input, so the
++ * input queue must be deeper than the largest DPB the stream may use:
++ * derive it from level and picture size (H.264 table A-1, HEVC A.4.2).
++ */
++static int x5dec_dpb_frames(AVCodecContext *avctx, int w, int h)
++{
++    static const struct { int level, max_dpb_mbs; } h264[] = {
++        {  9,    396 }, { 10,    396 }, { 11,    900 }, { 12,   2376 },
++        { 13,   2376 }, { 20,   2376 }, { 21,   4752 }, { 22,   8100 },
++        { 30,   8100 }, { 31,  18000 }, { 32,  20480 }, { 40,  32768 },
++        { 41,  32768 }, { 42,  34816 }, { 50, 110400 }, { 51, 184320 },
++        { 52, 184320 }, { 60, 696320 }, { 61, 696320 }, { 62, 696320 },
++    };
++    static const struct { int level, max_luma_ps; } hevc[] = {
++        {  30,    36864 }, {  60,   122880 }, {  63,   245760 },
++        {  90,   552960 }, {  93,   983040 }, { 120,  2228224 },
++        { 123,  2228224 }, { 150,  8912896 }, { 153,  8912896 },
++        { 156,  8912896 }, { 180, 35651584 }, { 183, 35651584 },
++        { 186, 35651584 },
++    };
++    int i;
++
++    if (avctx->codec_id == AV_CODEC_ID_H264) {
++        int mbs = ((w + 15) / 16) * ((h + 15) / 16);
++
++        for (i = 0; i < FF_ARRAY_ELEMS(h264); i++)
++            if (h264[i].level == avctx->level)
++                return av_clip(h264[i].max_dpb_mbs / mbs, 1, 16);
++    } else if (avctx->codec_id == AV_CODEC_ID_HEVC) {
++        int64_t ps = (int64_t)w * h;
++
++        for (i = 0; i < FF_ARRAY_ELEMS(hevc); i++) {
++            int64_t max = hevc[i].max_luma_ps;
++
++            if (hevc[i].level != avctx->level)
++                continue;
++            return ps <= max / 4 ? 16 : ps <= max / 2 ? 12 :
++                   ps <= max * 3 / 4 ? 8 : 6;
++        }
++    } else {
++        return 1;
++    }
++    /* level unknown: assume the worst the CMA budget allows */
++    return (int64_t)w * h <= 1920 * 1088 ? 16 : 8;
++}
++
++static av_cold int x5dec_init_hw(AVCodecContext *avctx)
++{
++    X5DecContext *s = avctx->priv_data;
++    mc_video_codec_dec_params_t *p = &s->mc.video_dec_params;
++    mc_av_codec_startup_params_t startup = { 0 };
++    int w = avctx->width  > 0 ? avctx->width  : 3840;
++    int h = avctx->height > 0 ? avctx->height : 2160;
++    int ret;
++
++    memset(&s->mc, 0, sizeof(s->mc));
++    s->mc.encoder = 0;
++    p->feed_mode           = MC_FEEDING_MODE_FRAME_SIZE;
++    p->pix_fmt             = MC_PIXEL_FORMAT_YUV420P;
++    /* 8 bits per pixel is far above any real compressed picture */
++    p->bitstream_buf_size  = FFALIGN(w * h, 0x400);
++    p->bitstream_buf_count = FFMAX(3, x5dec_dpb_frames(avctx, w, h) + 2);
++    /*
++     * With fewer output buffers than queued inputs the decoder holds the VPU
++     * core while it waits for a free buffer, and an encoder in the same
++     * process can no longer get its input buffers (dequeue times out).
++     */
++    p->frame_buf_count     = FFMAX(3, p->bitstream_buf_count - 2);
++
++    switch (avctx->codec_id) {
++    case AV_CODEC_ID_H264:
++        s->mc.codec_id = MEDIA_CODEC_ID_H264;
++        p->h264_dec_config.bandwidth_Opt  = 1;
++        p->h264_dec_config.reorder_enable = 1;
++        break;
++    case AV_CODEC_ID_HEVC:
++        s->mc.codec_id = MEDIA_CODEC_ID_H265;
++        p->h265_dec_config.bandwidth_Opt  = 1;
++        p->h265_dec_config.reorder_enable = 1;
++        break;
++    default:
++        s->mc.codec_id = MEDIA_CODEC_ID_MJPEG;
++        p->mjpeg_dec_config.rot_degree    = MC_CCW_0;
++        p->mjpeg_dec_config.mir_direction = MC_DIRECTION_NONE;
++        break;
++    }
++
++    ret = hb_mm_mc_initialize(&s->mc);
++    if (ret) {
++        av_log(avctx, AV_LOG_VERBOSE, "hb_mm_mc_initialize: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++    ret = hb_mm_mc_configure(&s->mc);
++    if (!ret)
++        ret = hb_mm_mc_start(&s->mc, &startup);
++    if (ret) {
++        av_log(avctx, AV_LOG_VERBOSE, "configure/start: 0x%x\n", ret);
++        hb_mm_mc_release(&s->mc);
++        return AVERROR_EXTERNAL;
++    }
++    s->started = 1;
++    /* full range streams come out as yuvj420p, like the native decoders */
++    avctx->pix_fmt = avctx->codec_id == AV_CODEC_ID_MJPEG ||
++                     avctx->pix_fmt == AV_PIX_FMT_YUVJ420P ||
++                     avctx->color_range == AVCOL_RANGE_JPEG ?
++                     AV_PIX_FMT_YUVJ420P : AV_PIX_FMT_YUV420P;
++    return 0;
++}
++
++static av_cold int x5dec_init(AVCodecContext *avctx)
++{
++    X5DecContext *s = avctx->priv_data;
++
++    s->last_pts = AV_NOPTS_VALUE;
++    s->pkt = av_packet_alloc();
++    if (!s->pkt)
++        return AVERROR(ENOMEM);
++    if (x5dec_hw_usable(avctx) && x5dec_init_hw(avctx) == 0) {
++        av_log(avctx, AV_LOG_INFO, "using RDK X5 hardware decoder\n");
++        return 0;
++    }
++    av_log(avctx, AV_LOG_INFO, "using software decoder\n");
++    return x5dec_init_sw(avctx);
++}
++
++/* pkt == NULL signals end of stream */
++static int x5dec_send(AVCodecContext *avctx, const AVPacket *pkt)
++{
++    X5DecContext *s = avctx->priv_data;
++    media_codec_buffer_t in = { 0 };
++    int ret;
++
++    in.type = MC_VIDEO_STREAM_BUFFER;
++    ret = hb_mm_mc_dequeue_input_buffer(&s->mc, &in, X5DEC_TIMEOUT_MS);
++    if (ret) {
++        av_log(avctx, AV_LOG_ERROR, "dequeue input: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++    if (pkt && pkt->size > in.vstream_buf.size) {
++        av_log(avctx, AV_LOG_ERROR, "packet %d > stream buffer %u\n",
++               pkt->size, in.vstream_buf.size);
++        in.vstream_buf.size = 0;
++        hb_mm_mc_queue_input_buffer(&s->mc, &in, X5DEC_TIMEOUT_MS);
++        return AVERROR_EXTERNAL;
++    }
++    in.type = MC_VIDEO_STREAM_BUFFER;
++    if (pkt) {
++        memcpy(in.vstream_buf.vir_ptr, pkt->data, pkt->size);
++        in.vstream_buf.size       = pkt->size;
++        /* raw Annex B input has dts only */
++        x5dec_push_pts(s, pkt);
++        in.vstream_buf.stream_end = 0;
++    } else {
++        in.vstream_buf.size       = 0;
++        in.vstream_buf.stream_end = 1;
++    }
++    ret = hb_mm_mc_queue_input_buffer(&s->mc, &in, X5DEC_TIMEOUT_MS);
++    if (ret) {
++        av_log(avctx, AV_LOG_ERROR, "queue input: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++    return 0;
++}
++
++static int x5dec_output(AVCodecContext *avctx, AVFrame *frame,
++                        const media_codec_buffer_t *out,
++                        const media_codec_output_buffer_info_t *info)
++{
++    X5DecContext *s = avctx->priv_data;
++    const mc_video_frame_buffer_info_t *vf = &out->vframe_buf;
++    int w, h, ret;
++
++    if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
++        w = info->jpeg_frame_info.display_width;
++        h = info->jpeg_frame_info.display_height;
++    } else {
++        w = info->video_frame_info.display_width;
++        h = info->video_frame_info.display_height;
++    }
++    if (w <= 0 || h <= 0) {
++        w = vf->width;
++        h = vf->height;
++    }
++    if (w != avctx->width || h != avctx->height) {
++        ret = ff_set_dimensions(avctx, w, h);
++        if (ret < 0)
++            return ret;
++    }
++    ret = ff_get_buffer(avctx, frame, 0);
++    if (ret < 0)
++        return ret;
++
++    /* I420 output: vstride is the chroma stride */
++    av_image_copy_plane(frame->data[0], frame->linesize[0],
++                        vf->vir_ptr[0], vf->stride, w, h);
++    av_image_copy_plane(frame->data[1], frame->linesize[1],
++                        vf->vir_ptr[1], vf->vstride, (w + 1) / 2,
++                        (h + 1) / 2);
++    av_image_copy_plane(frame->data[2], frame->linesize[2],
++                        vf->vir_ptr[2], vf->vstride, (w + 1) / 2,
++                        (h + 1) / 2);
++    /* like the native decoders: no packet pts -> no frame pts */
++    x5dec_pop_pts(s, frame);
++    /*
++     * ff_get_buffer() copied the dts of the newest packet, a whole pipeline
++     * ahead of this picture. Use the pts instead: it is monotonic in output
++     * order, and callers like OpenCV read pkt_dts when pts is 0.
++     */
++    frame->pkt_dts = frame->pts;
++    return 0;
++}
++
++/*
++ * Dequeue one output buffer (blocking). Returns 0 with a frame,
++ * AVERROR(EAGAIN) if the buffer carried no picture, AVERROR_EOF once the
++ * empty frame_end buffer that follows stream_end has been seen.
++ */
++static int x5dec_get_frame(AVCodecContext *avctx, AVFrame *frame)
++{
++    X5DecContext *s = avctx->priv_data;
++    media_codec_buffer_t out = { 0 };
++    media_codec_output_buffer_info_t info = { 0 };
++    int ret, valid;
++
++    if (s->eos)
++        return AVERROR_EOF;
++    ret = hb_mm_mc_dequeue_output_buffer(&s->mc, &out, &info,
++                                         X5DEC_TIMEOUT_MS);
++    if (ret) {
++        av_log(avctx, AV_LOG_ERROR, "dequeue output: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++    if (out.vframe_buf.frame_end && !out.vframe_buf.size)
++        s->eos = 1;
++    valid = out.type == MC_VIDEO_FRAME_BUFFER &&
++            out.vframe_buf.size > 0 &&
++            info.video_frame_info.decode_result != 0;
++    ret = valid ? x5dec_output(avctx, frame, &out, &info) : AVERROR(EAGAIN);
++    if (hb_mm_mc_queue_output_buffer(&s->mc, &out, X5DEC_TIMEOUT_MS))
++        av_log(avctx, AV_LOG_WARNING, "queue output buffer failed\n");
++    return ret;
++}
++
++/*
++ * Keep the hardware input queue full and only block on output when no more
++ * input can be queued (queue full or end of stream). The library has no
++ * non-blocking dequeue (timeout 0 is an error, and a 1 ms timeout costs a
++ * whole 10 ms scheduler tick at HZ=100), so queue levels are read with
++ * hb_mm_mc_get_status() instead of polling.
++ */
++static int x5dec_receive_frame_sw(AVCodecContext *avctx, AVFrame *frame)
++{
++    X5DecContext *s = avctx->priv_data;
++    int ret;
++
++    for (;;) {
++        ret = avcodec_receive_frame(s->sw, frame);
++        if (ret == 0 && s->drop) {
++            /* already returned by the hardware before the switch */
++            if (frame->pts == AV_NOPTS_VALUE || s->last_pts == AV_NOPTS_VALUE ?
++                s->drop-- > 0 : frame->pts <= s->last_pts) {
++                av_frame_unref(frame);
++                continue;
++            }
++            s->drop = 0;
++        }
++        if (ret != AVERROR(EAGAIN))
++            break;
++        if (s->replay_pos < s->nb_replay) {
++            ret = avcodec_send_packet(s->sw, s->replay[s->replay_pos++]);
++            if (s->replay_pos == s->nb_replay)
++                x5dec_replay_reset(s);
++        } else {
++            if (s->replay_eos)
++                ret = AVERROR_EOF;
++            else
++                ret = ff_decode_get_packet(avctx, s->pkt);
++            if (ret < 0 && ret != AVERROR_EOF)
++                return ret;
++            ret = avcodec_send_packet(s->sw,
++                                      ret == AVERROR_EOF ? NULL : s->pkt);
++            av_packet_unref(s->pkt);
++        }
++        if (ret < 0 && ret != AVERROR_EOF)
++            return ret;
++    }
++    if (ret == 0) {
++        /* callers read stream properties from the context, not the frame */
++        avctx->pix_fmt             = s->sw->pix_fmt;
++        avctx->profile             = s->sw->profile;
++        avctx->level               = s->sw->level;
++        avctx->has_b_frames        = s->sw->has_b_frames;
++        avctx->sample_aspect_ratio = s->sw->sample_aspect_ratio;
++        avctx->color_range         = s->sw->color_range;
++        avctx->colorspace          = s->sw->colorspace;
++        avctx->color_primaries     = s->sw->color_primaries;
++        avctx->color_trc           = s->sw->color_trc;
++        avctx->chroma_sample_location = s->sw->chroma_sample_location;
++        if (s->sw->width != avctx->width || s->sw->height != avctx->height)
++            ret = ff_set_dimensions(avctx, s->sw->width, s->sw->height);
++    }
++    return ret;
++}
++
++static int x5dec_receive_frame_hw(AVCodecContext *avctx, AVFrame *frame)
++{
++    X5DecContext *s = avctx->priv_data;
++    int ret;
++
++    for (;;) {
++        mc_inter_status_t st = { 0 };
++        int have, room;
++
++        /*
++         * Always take the packet libavcodec buffered, even if a frame is
++         * ready: otherwise the next avcodec_send_packet() returns EAGAIN,
++         * which callers such as OpenCV treat as an error and drop the packet.
++         */
++        while (!s->eos_pending && !s->eos_sent &&
++               s->nb_pending < X5DEC_MAX_PENDING) {
++            ret = ff_decode_get_packet(avctx, s->pkt);
++            if (ret == AVERROR_EOF)
++                s->eos_pending = 1;
++            else if (ret < 0 && ret != AVERROR(EAGAIN))
++                return ret;
++            if (ret < 0)
++                break;
++            s->pending[s->nb_pending] = av_packet_alloc();
++            if (!s->pending[s->nb_pending])
++                return AVERROR(ENOMEM);
++            av_packet_move_ref(s->pending[s->nb_pending++], s->pkt);
++            s->may_output = 1;
++        }
++        if (!s->may_output && !s->eos_pending && !s->eos_sent)
++            return AVERROR(EAGAIN);
++        have = s->nb_pending || s->eos_pending;
++
++        ret = hb_mm_mc_get_status(&s->mc, &st);
++        if (ret) {
++            av_log(avctx, AV_LOG_ERROR, "get status: 0x%x\n", ret);
++            return AVERROR_EXTERNAL;
++        }
++        room = st.cur_input_buf_cnt <
++               s->mc.video_dec_params.bitstream_buf_count;
++
++        if (have && room && !st.cur_output_buf_cnt) {
++            if (s->nb_pending) {
++                x5dec_pending_pop(s);
++                x5dec_replay_add(s, s->pkt);
++                ret = x5dec_send(avctx, s->pkt);
++                s->nb_sent++;
++                av_packet_unref(s->pkt);
++            } else {
++                ret = x5dec_send(avctx, NULL);
++                s->eos_sent = 1;
++                s->eos_pending = 0;
++            }
++            if (ret < 0)
++                return ret;
++            continue;
++        }
++        /* nothing to decode yet: ask for more input */
++        if (!have && room && !st.cur_output_buf_cnt && !s->eos_sent)
++            return AVERROR(EAGAIN);
++
++        /*
++         * Drained: the empty frame_end buffer only follows stream_end when
++         * frames were still held for reordering, so check the counters.
++         */
++        if (s->eos_sent && !st.cur_input_buf_cnt && !st.cur_output_buf_cnt &&
++            st.total_output_buf_cnt >= st.total_input_buf_cnt)
++            return AVERROR_EOF;
++
++        /* a frame is ready, the input queue is full or the stream ended */
++        ret = x5dec_get_frame(avctx, frame);
++        if (ret == 0) {
++            s->may_output = 0;
++            s->nb_out++;
++            if (frame->pts != AV_NOPTS_VALUE)
++                s->last_pts = frame->pts;
++        }
++        if (ret != AVERROR(EAGAIN))
++            return ret;
++    }
++}
++
++static int x5dec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
++{
++    X5DecContext *s = avctx->priv_data;
++    int ret;
++
++    if (!s->sw) {
++        ret = x5dec_receive_frame_hw(avctx, frame);
++        if (ret != AVERROR_EXTERNAL)
++            return ret;
++        av_log(avctx, AV_LOG_WARNING, "hardware decoder failed, switching "
++               "to software decoding\n");
++        hb_mm_mc_stop(&s->mc);
++        hb_mm_mc_release(&s->mc);
++        s->started = 0;
++        ret = x5dec_init_sw(avctx);
++        if (ret < 0)
++            return ret;
++        /* without pts: frames output since the keyframe was queued */
++        s->drop = FFMAX(s->nb_out - s->sent_at_key, 0);
++        if (s->last_pts != AV_NOPTS_VALUE)
++            s->drop = 1;
++        /* packets held back for the hardware go to software too */
++        while (s->nb_pending) {
++            x5dec_pending_pop(s);
++            x5dec_replay_add(s, s->pkt);
++            av_packet_unref(s->pkt);
++        }
++        s->replay_eos = s->eos_sent || s->eos_pending;
++    }
++    return x5dec_receive_frame_sw(avctx, frame);
++}
++
++/* seek: restart the hardware instance, there is no reset in the API */
++static void x5dec_flush(AVCodecContext *avctx)
++{
++    X5DecContext *s = avctx->priv_data;
++
++    x5dec_replay_reset(s);
++    x5dec_pending_reset(s);
++    av_packet_unref(s->pkt);
++    s->nb_pts = s->drop = 0;
++    s->nb_out = s->nb_sent = s->sent_at_key = 0;
++    s->last_pts = AV_NOPTS_VALUE;
++    s->eos_pending = s->eos_sent = s->eos = s->replay_eos = 0;
++    s->may_output = 0;
++    if (s->sw) {
++        avcodec_flush_buffers(s->sw);
++        return;
++    }
++    if (s->started) {
++        hb_mm_mc_stop(&s->mc);
++        hb_mm_mc_release(&s->mc);
++        s->started = 0;
++    }
++    if (x5dec_init_hw(avctx) < 0 && x5dec_init_sw(avctx) < 0)
++        av_log(avctx, AV_LOG_ERROR, "decoder restart after flush failed\n");
++}
++
++#define X5DEC(NAME, LONGNAME, ID, BSFS)                                     \
++    static const AVClass x5_##NAME##_dec_class = {                          \
++        .class_name = #NAME "_x5_decoder",                                  \
++        .item_name  = av_default_item_name,                                 \
++        .version    = LIBAVUTIL_VERSION_INT,                                \
++    };                                                                      \
++    const FFCodec ff_##NAME##_x5_decoder = {                                \
++        .p.name         = #NAME "_x5",                                      \
++        CODEC_LONG_NAME("RDK X5 " LONGNAME                                  \
++                        " hardware decoder (software fallback)"),           \
++        .p.type         = AVMEDIA_TYPE_VIDEO,                               \
++        .p.id           = ID,                                               \
++        .p.priv_class   = &x5_##NAME##_dec_class,                           \
++        .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE |      \
++                          AV_CODEC_CAP_AVOID_PROBING,                       \
++        .p.wrapper_name = "x5mm",                                           \
++        .priv_data_size = sizeof(X5DecContext),                             \
++        .init           = x5dec_init,                                       \
++        FF_CODEC_RECEIVE_FRAME_CB(x5dec_receive_frame),                     \
++        .flush          = x5dec_flush,                                      \
++        .close          = x5dec_close,                                      \
++        .bsfs           = BSFS,                                             \
++        .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP |                       \
++                          FF_CODEC_CAP_AUTO_THREADS,                        \
++    };
++
++X5DEC(h264,  "H.264", AV_CODEC_ID_H264,  "h264_mp4toannexb")
++X5DEC(hevc,  "HEVC",  AV_CODEC_ID_HEVC,  "hevc_mp4toannexb")
++X5DEC(mjpeg, "MJPEG", AV_CODEC_ID_MJPEG, NULL)
+diff --git a/libavcodec/x5enc.c b/libavcodec/x5enc.c
+new file mode 100644
+index 0000000..9dc0000
+--- /dev/null
++++ b/libavcodec/x5enc.c
+@@ -0,0 +1,622 @@
++/*
++ * RDK X5 hardware encoder (H.264/HEVC on VPU, MJPEG on JPU)
++ * through D-Robotics libmultimedia (hb_mm_mc_* API).
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include <hb_media_codec.h>
++#include <hb_media_error.h>
++
++#include "config_components.h"
++
++#include "libavutil/imgutils.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "avcodec.h"
++#include "codec_internal.h"
++#include "encode.h"
++#include "x5enc.h"
++
++#define X5ENC_TIMEOUT_MS 5000
++
++struct X5Enc {
++    media_codec_context_t mc;
++    int started;
++    int width, height;      /* coded size, see x5enc_coded_size() */
++};
++
++/*
++ * The VPU wants the width (and, to be safe, the height) to be a multiple
++ * of 8: portrait phone videos scaled to 720p are 540 or 406 wide. Encode
++ * the padded size and signal the real one with SPS cropping, which the
++ * VPU writes without touching the input. The JPU takes any size.
++ */
++static void x5enc_coded_size(AVCodecContext *avctx, int *w, int *h)
++{
++    if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
++        *w = avctx->width;
++        *h = avctx->height;
++    } else {
++        *w = FFALIGN(avctx->width, 8);
++        *h = FFALIGN(avctx->height, 8);
++    }
++}
++
++int ff_x5_enabled(void)
++{
++    const char *e = getenv("X5_CODEC_DISABLE");
++
++    return !(e && *e && strcmp(e, "0"));
++}
++
++static int x5enc_set_rc(AVCodecContext *avctx, X5Enc *s,
++                        const X5EncParams *par)
++{
++    mc_rate_control_params_t *rc = &s->mc.video_enc_params.rc_params;
++    int is_h264 = avctx->codec_id == AV_CODEC_ID_H264;
++    int gop = avctx->gop_size > 0 ? avctx->gop_size : par->gop;
++    int fps = 30, kbps, ret;
++
++    if (avctx->framerate.num > 0 && avctx->framerate.den > 0)
++        fps = lrint(av_q2d(avctx->framerate));
++    else if (avctx->time_base.num > 0 && avctx->time_base.den > 0)
++        fps = lrint(av_q2d(av_inv_q(avctx->time_base)));
++    fps = av_clip(fps, 1, 240);
++
++    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
++        rc->mode = MC_AV_RC_MODE_MJPEGFIXQP;
++    else if (par->qp >= 0)
++        rc->mode = is_h264 ? MC_AV_RC_MODE_H264FIXQP : MC_AV_RC_MODE_H265FIXQP;
++    else
++        rc->mode = is_h264 ? MC_AV_RC_MODE_H264CBR : MC_AV_RC_MODE_H265CBR;
++
++    /* fills in the library defaults for the selected mode */
++    ret = hb_mm_mc_get_rate_control_config(&s->mc, rc);
++    if (ret) {
++        av_log(avctx, AV_LOG_VERBOSE, "get rc config: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++
++    /* no -b:v given: about 0.1 bit per pixel */
++    kbps = avctx->bit_rate > 0 ? avctx->bit_rate / 1000 :
++           (int64_t)avctx->width * avctx->height * fps / 10000;
++    kbps = av_clip(kbps, 1, 700000);
++
++#define SET_CBR(p) do {                                     \
++        (p).intra_period = gop;                             \
++        (p).frame_rate   = fps;                             \
++        (p).bit_rate     = kbps;                            \
++    } while (0)
++#define SET_FIXQP(p) do {                                   \
++        (p).intra_period = gop;                             \
++        (p).frame_rate   = fps;                             \
++        (p).force_qp_I   = par->qp;                         \
++        (p).force_qp_P   = par->qp;                         \
++        (p).force_qp_B   = par->qp;                         \
++    } while (0)
++
++    switch (rc->mode) {
++    case MC_AV_RC_MODE_H264CBR:   SET_CBR(rc->h264_cbr_params);     break;
++    case MC_AV_RC_MODE_H265CBR:   SET_CBR(rc->h265_cbr_params);     break;
++    case MC_AV_RC_MODE_H264FIXQP: SET_FIXQP(rc->h264_fixqp_params); break;
++    case MC_AV_RC_MODE_H265FIXQP: SET_FIXQP(rc->h265_fixqp_params); break;
++    default:
++        rc->mjpeg_fixqp_params.frame_rate     = fps;
++        rc->mjpeg_fixqp_params.quality_factor = par->quality;
++        break;
++    }
++    return 0;
++}
++
++/* signal the sample range; the library default marks streams full range */
++static int x5enc_set_vui(AVCodecContext *avctx, X5Enc *s)
++{
++    mc_video_vui_params_t vui = { 0 };
++    int full = avctx->color_range == AVCOL_RANGE_JPEG ||
++               avctx->pix_fmt == AV_PIX_FMT_YUVJ420P;
++    int ret;
++
++    ret = hb_mm_mc_get_vui_config(&s->mc, &vui);
++    if (ret)
++        goto fail;
++    /* sar must be valid even when aspect_ratio_info is not written */
++#define SET_VUI(v) do {                                     \
++        (v).sar_width  = FFMAX((v).sar_width,  1);          \
++        (v).sar_height = FFMAX((v).sar_height, 1);          \
++        (v).video_signal_type_present_flag = 1;             \
++        (v).video_format          = 5;                      \
++        (v).video_full_range_flag = full;                   \
++    } while (0)
++    if (s->mc.codec_id == MEDIA_CODEC_ID_H264)
++        SET_VUI(vui.h264_vui);
++    else
++        SET_VUI(vui.h265_vui);
++    ret = hb_mm_mc_set_vui_config(&s->mc, &vui);
++    if (!ret)
++        return 0;
++fail:
++    av_log(avctx, AV_LOG_VERBOSE, "VUI config: 0x%x\n", ret);
++    return AVERROR_EXTERNAL;
++}
++
++void ff_x5enc_close(X5Enc **enc)
++{
++    X5Enc *s = *enc;
++
++    if (!s)
++        return;
++    if (s->started) {
++        hb_mm_mc_stop(&s->mc);
++        hb_mm_mc_release(&s->mc);
++    }
++    av_freep(enc);
++}
++
++static int x5enc_open_hw(AVCodecContext *avctx, const X5EncParams *par,
++                         X5Enc *s)
++{
++    mc_video_codec_enc_params_t *p = &s->mc.video_enc_params;
++    mc_av_codec_startup_params_t startup = { 0 };
++    int ret;
++
++    s->mc.encoder = 1;
++    switch (avctx->codec_id) {
++    case AV_CODEC_ID_H264: s->mc.codec_id = MEDIA_CODEC_ID_H264;  break;
++    case AV_CODEC_ID_HEVC: s->mc.codec_id = MEDIA_CODEC_ID_H265;  break;
++    default:               s->mc.codec_id = MEDIA_CODEC_ID_MJPEG; break;
++    }
++
++    x5enc_coded_size(avctx, &s->width, &s->height);
++    p->width  = s->width;
++    p->height = s->height;
++    if (s->width != avctx->width || s->height != avctx->height) {
++        p->frame_cropping_flag = 1;
++        p->crop_rect.x_pos  = 0;
++        p->crop_rect.y_pos  = 0;
++        p->crop_rect.width  = avctx->width;
++        p->crop_rect.height = avctx->height;
++    }
++    p->pix_fmt = avctx->pix_fmt == AV_PIX_FMT_NV12 ?
++                 MC_PIXEL_FORMAT_NV12 : MC_PIXEL_FORMAT_YUV420P;
++    p->frame_buf_count     = 3;
++    p->external_frame_buf  = 0;
++    p->bitstream_buf_count = 3;
++    p->bitstream_buf_size  = FFALIGN(s->width * s->height * 3 / 2,
++                                     0x1000);
++    /*
++     * wave521cl: no B frames, single reference -> preset 9 (I-P-P-P, one
++     * reference). Preset 1 is all intra.
++     */
++    p->gop_params.gop_preset_idx = 9;
++    p->rot_degree      = MC_CCW_0;
++    p->mir_direction   = MC_DIRECTION_NONE;
++    p->enable_user_pts = 1;
++    if (s->mc.codec_id == MEDIA_CODEC_ID_H264) {
++        switch (par->profile) {
++        case AV_PROFILE_H264_BASELINE:
++        case AV_PROFILE_H264_CONSTRAINED_BASELINE:
++            p->h264_enc_config.h264_profile = MC_H264_PROFILE_BP;
++            break;
++        case AV_PROFILE_H264_MAIN:
++            p->h264_enc_config.h264_profile = MC_H264_PROFILE_MP;
++            break;
++        case AV_PROFILE_H264_HIGH:
++            p->h264_enc_config.h264_profile = MC_H264_PROFILE_HP;
++            break;
++        }
++    } else if (s->mc.codec_id == MEDIA_CODEC_ID_MJPEG) {
++        p->mjpeg_enc_config.restart_interval = avctx->width / 16;
++        if (avctx->pix_fmt == AV_PIX_FMT_NV12 &&
++            avctx->color_range != AVCOL_RANGE_JPEG)
++            av_log(avctx, AV_LOG_WARNING, "JPEG is full range but the "
++                   "NV12 input is not; use -vf scale=out_range=pc\n");
++    }
++
++    ret = x5enc_set_rc(avctx, s, par);
++    if (ret < 0)
++        return ret;
++
++    ret = hb_mm_mc_initialize(&s->mc);
++    if (ret) {
++        av_log(avctx, AV_LOG_VERBOSE, "hb_mm_mc_initialize: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++    ret = hb_mm_mc_configure(&s->mc);
++    if (ret) {
++        av_log(avctx, AV_LOG_VERBOSE, "configure: 0x%x\n", ret);
++        hb_mm_mc_release(&s->mc);
++        return AVERROR_EXTERNAL;
++    }
++    s->started = 1;
++    if (s->mc.codec_id != MEDIA_CODEC_ID_MJPEG) {
++        ret = x5enc_set_vui(avctx, s);
++        if (ret < 0)
++            return ret;
++    }
++    ret = hb_mm_mc_start(&s->mc, &startup);
++    if (ret) {
++        av_log(avctx, AV_LOG_VERBOSE, "start: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++    return 0;
++}
++
++/* returns the NAL type of an Annex B NAL starting at buf (after 00 00 01) */
++static int x5enc_nal_type(enum AVCodecID id, uint8_t b)
++{
++    return id == AV_CODEC_ID_H264 ? b & 0x1f : (b >> 1) & 0x3f;
++}
++
++static int x5enc_is_key(AVCodecContext *avctx, const uint8_t *buf, int size)
++{
++    int i;
++
++    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
++        return 1;
++    for (i = 0; i + 3 < size; i++) {
++        int t;
++
++        if (buf[i] || buf[i + 1] || buf[i + 2] != 1)
++            continue;
++        t = x5enc_nal_type(avctx->codec_id, buf[i + 3]);
++        if (avctx->codec_id == AV_CODEC_ID_H264) {
++            if (t == 5)
++                return 1;
++            if (t >= 1 && t <= 4)
++                return 0;
++        } else {
++            if (t >= 16 && t <= 21)
++                return 1;
++            if (t < 16)
++                return 0;
++        }
++    }
++    return 0;
++}
++
++/* replicate the last column and row of a w x h plane up to aw x ah */
++static void x5enc_pad_plane(uint8_t *p, int stride, int w, int h,
++                            int aw, int ah, int bpp)
++{
++    int x, y;
++
++    if (aw > w)
++        for (y = 0; y < h; y++) {
++            uint8_t *row = p + y * stride;
++
++            for (x = w; x < aw; x++)
++                memcpy(row + x * bpp, row + (w - 1) * bpp, bpp);
++        }
++    for (y = h; y < ah; y++)
++        memcpy(p + y * stride, p + (h - 1) * stride, aw * bpp);
++}
++
++/* copy f into the w x h coded buffer (w, h >= the frame size) */
++static void x5enc_copy_frame(mc_video_frame_buffer_info_t *vf,
++                             const AVFrame *f, int aw, int ah)
++{
++    int w = f->width, h = f->height;
++    int ls = vf->stride > 0 ? vf->stride : aw;
++    int cs = ls / 2;
++    int pad = aw != w || ah != h;
++
++    av_image_copy_plane(vf->vir_ptr[0], ls, f->data[0], f->linesize[0],
++                        w, h);
++    if (pad)
++        x5enc_pad_plane(vf->vir_ptr[0], ls, w, h, aw, ah, 1);
++    if (f->format == AV_PIX_FMT_NV12) {
++        av_image_copy_plane(vf->vir_ptr[1], ls, f->data[1], f->linesize[1],
++                            w, h / 2);
++        if (pad)
++            x5enc_pad_plane(vf->vir_ptr[1], ls, w / 2, h / 2,
++                            aw / 2, ah / 2, 2);
++        return;
++    }
++    av_image_copy_plane(vf->vir_ptr[1], cs, f->data[1], f->linesize[1],
++                        w / 2, h / 2);
++    av_image_copy_plane(vf->vir_ptr[2], cs, f->data[2], f->linesize[2],
++                        w / 2, h / 2);
++    if (pad) {
++        x5enc_pad_plane(vf->vir_ptr[1], cs, w / 2, h / 2, aw / 2, ah / 2, 1);
++        x5enc_pad_plane(vf->vir_ptr[2], cs, w / 2, h / 2, aw / 2, ah / 2, 1);
++    }
++}
++
++int ff_x5enc_encode(AVCodecContext *avctx, X5Enc *s, AVPacket *pkt,
++                    const AVFrame *f, int *got_packet)
++{
++    media_codec_buffer_t in = { 0 }, out = { 0 };
++    media_codec_output_buffer_info_t info = { 0 };
++    int ret;
++
++    *got_packet = 0;
++    if (!f)
++        return 0;
++
++    if (f->pict_type == AV_PICTURE_TYPE_I &&
++        s->mc.codec_id != MEDIA_CODEC_ID_MJPEG)
++        hb_mm_mc_request_idr_frame(&s->mc);
++
++    /* the VPU/JPU emits exactly one packet per frame (no B frames) */
++    in.type = MC_VIDEO_FRAME_BUFFER;
++    ret = hb_mm_mc_dequeue_input_buffer(&s->mc, &in, X5ENC_TIMEOUT_MS);
++    if (ret) {
++        av_log(avctx, AV_LOG_ERROR, "dequeue input: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++    x5enc_copy_frame(&in.vframe_buf, f, s->width, s->height);
++    in.type = MC_VIDEO_FRAME_BUFFER;
++    in.vframe_buf.width   = s->width;
++    in.vframe_buf.height  = s->height;
++    in.vframe_buf.pix_fmt = s->mc.video_enc_params.pix_fmt;
++    in.vframe_buf.pts     = f->pts;
++    ret = hb_mm_mc_queue_input_buffer(&s->mc, &in, X5ENC_TIMEOUT_MS);
++    if (ret) {
++        av_log(avctx, AV_LOG_ERROR, "queue input: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++
++    ret = hb_mm_mc_dequeue_output_buffer(&s->mc, &out, &info,
++                                         X5ENC_TIMEOUT_MS);
++    if (ret) {
++        av_log(avctx, AV_LOG_ERROR, "dequeue output: 0x%x\n", ret);
++        return AVERROR_EXTERNAL;
++    }
++    ret = ff_get_encode_buffer(avctx, pkt, out.vstream_buf.size, 0);
++    if (!ret) {
++        memcpy(pkt->data, out.vstream_buf.vir_ptr, out.vstream_buf.size);
++        pkt->pts      = pkt->dts = f->pts;
++        pkt->duration = f->duration;
++        if (x5enc_is_key(avctx, pkt->data, pkt->size))
++            pkt->flags |= AV_PKT_FLAG_KEY;
++        /* one packet per frame: carry the frame opaque like encode.c does */
++        ret = ff_encode_reordered_opaque(avctx, pkt, f);
++        *got_packet = ret >= 0;
++    }
++    if (hb_mm_mc_queue_output_buffer(&s->mc, &out, X5ENC_TIMEOUT_MS))
++        av_log(avctx, AV_LOG_WARNING, "queue output buffer failed\n");
++    return ret;
++}
++
++/*
++ * The library puts parameter sets in front of each IDR frame only. To get
++ * them up front, encode one gray frame on a scratch instance with the same
++ * settings and keep its VPS/SPS/PPS.
++ */
++static int x5enc_get_headers(AVCodecContext *avctx, const X5EncParams *par)
++{
++    enum AVCodecID id = avctx->codec_id;
++    X5Enc *tmp = av_mallocz(sizeof(*tmp));
++    AVFrame *f = av_frame_alloc();
++    AVPacket *pkt = av_packet_alloc();
++    int ret, got = 0, i, start = -1, n = 0;
++    uint8_t *ex;
++
++    if (!tmp || !f || !pkt) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++    f->format = avctx->pix_fmt;
++    f->width  = avctx->width;
++    f->height = avctx->height;
++    ret = av_frame_get_buffer(f, 0);
++    if (ret < 0)
++        goto end;
++    for (i = 0; i < 4 && f->data[i]; i++)
++        memset(f->data[i], 128, f->linesize[i] *
++               (i ? AV_CEIL_RSHIFT(f->height, 1) : f->height));
++    f->pts = 0;
++
++    ret = x5enc_open_hw(avctx, par, tmp);
++    if (!ret)
++        ret = ff_x5enc_encode(avctx, tmp, pkt, f, &got);
++    if (ret < 0 || !got) {
++        ret = ret < 0 ? ret : AVERROR_EXTERNAL;
++        goto end;
++    }
++
++    ex = av_mallocz(pkt->size + AV_INPUT_BUFFER_PADDING_SIZE);
++    if (!ex) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++    /* copy the leading parameter set NALs, with their start codes */
++    for (i = 0; i + 3 <= pkt->size; i++) {
++        int t;
++
++        if (i + 3 < pkt->size && !pkt->data[i] && !pkt->data[i + 1] &&
++            pkt->data[i + 2] == 1) {
++            int sc = i > 0 && !pkt->data[i - 1] ? i - 1 : i;
++
++            if (start >= 0) {
++                memcpy(ex + n, pkt->data + start, sc - start);
++                n += sc - start;
++                start = -1;
++            }
++            t = x5enc_nal_type(id, pkt->data[i + 3]);
++            if (id == AV_CODEC_ID_H264 ? (t == 7 || t == 8) :
++                                         (t >= 32 && t <= 34))
++                start = sc;
++            else if (id == AV_CODEC_ID_H264 ? (t >= 1 && t <= 5) : t < 32)
++                break;
++            i += 2;
++        }
++    }
++    if (!n) {
++        av_free(ex);
++        ret = AVERROR_EXTERNAL;
++        goto end;
++    }
++    av_freep(&avctx->extradata);
++    avctx->extradata      = ex;
++    avctx->extradata_size = n;
++    ret = 0;
++end:
++    ff_x5enc_close(&tmp);
++    av_frame_free(&f);
++    av_packet_free(&pkt);
++    return ret;
++}
++
++int ff_x5enc_open(AVCodecContext *avctx, const X5EncParams *par, X5Enc **enc)
++{
++    X5Enc *s;
++    int ret;
++
++    *enc = NULL;
++    if (!ff_x5_enabled())
++        return AVERROR(ENOSYS);
++    if (avctx->pix_fmt != AV_PIX_FMT_NV12 &&
++        avctx->pix_fmt != AV_PIX_FMT_YUV420P &&
++        avctx->pix_fmt != AV_PIX_FMT_YUVJ420P)
++        return AVERROR(ENOSYS);
++    if ((avctx->width | avctx->height) & 1)
++        return AVERROR(ENOSYS);
++
++    if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) &&
++        avctx->codec_id != AV_CODEC_ID_MJPEG) {
++        ret = x5enc_get_headers(avctx, par);
++        if (ret < 0)
++            return ret;
++    }
++
++    s = av_mallocz(sizeof(*s));
++    if (!s)
++        return AVERROR(ENOMEM);
++    ret = x5enc_open_hw(avctx, par, s);
++    if (ret < 0) {
++        ff_x5enc_close(&s);
++        return ret;
++    }
++    avctx->has_b_frames = 0;
++    *enc = s;
++    return 0;
++}
++
++/* ---- standalone h264_x5 / hevc_x5 / mjpeg_x5 encoders ---- */
++
++typedef struct X5EncCodecContext {
++    const AVClass *class;
++    X5Enc *enc;
++    int qp;
++    int quality;
++} X5EncCodecContext;
++
++static av_cold int x5enc_init(AVCodecContext *avctx)
++{
++    X5EncCodecContext *c = avctx->priv_data;
++    X5EncParams par = {
++        .qp      = c->qp,
++        .quality = c->quality,
++        .profile = avctx->profile,
++        .gop     = 60,
++    };
++    int ret = ff_x5enc_open(avctx, &par, &c->enc);
++
++    if (ret == AVERROR(ENOSYS))
++        av_log(avctx, AV_LOG_ERROR, "hardware encoder disabled or input "
++               "not supported (needs nv12/yuv420p, even size)\n");
++    else if (ret < 0)
++        av_log(avctx, AV_LOG_ERROR, "hardware encoder open failed\n");
++    return ret;
++}
++
++static int x5enc_encode2(AVCodecContext *avctx, AVPacket *pkt,
++                         const AVFrame *frame, int *got_packet)
++{
++    X5EncCodecContext *c = avctx->priv_data;
++
++    return ff_x5enc_encode(avctx, c->enc, pkt, frame, got_packet);
++}
++
++static av_cold int x5enc_close(AVCodecContext *avctx)
++{
++    X5EncCodecContext *c = avctx->priv_data;
++
++    ff_x5enc_close(&c->enc);
++    return 0;
++}
++
++#define OFFSET(x) offsetof(X5EncCodecContext, x)
++#define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
++static const AVOption x5enc_options[] = {
++    { "qp", "constant QP (0-51); enables FIXQP instead of CBR",
++      OFFSET(qp), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 51, VE },
++    { NULL }
++};
++
++static const AVOption x5enc_mjpeg_options[] = {
++    { "quality", "JPEG quality factor (0-100)",
++      OFFSET(quality), AV_OPT_TYPE_INT, { .i64 = 85 }, 0, 100, VE },
++    { NULL }
++};
++
++static const FFCodecDefault x5enc_defaults[] = {
++    { "b", "0" },
++    { "g", "60" },
++    { NULL },
++};
++
++static const enum AVPixelFormat x5enc_pix_fmts[] = {
++    AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE
++};
++
++/* JPEG is full range by convention: yuv420p input gets range-expanded */
++static const enum AVPixelFormat x5enc_mjpeg_pix_fmts[] = {
++    AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_NV12, AV_PIX_FMT_NONE
++};
++
++#define X5ENC(NAME, LONGNAME, ID, OPTS, FMTS)                               \
++    static const AVClass x5_##NAME##_enc_class = {                          \
++        .class_name = #NAME "_x5_encoder",                                  \
++        .item_name  = av_default_item_name,                                 \
++        .option     = OPTS,                                                 \
++        .version    = LIBAVUTIL_VERSION_INT,                                \
++    };                                                                      \
++    const FFCodec ff_##NAME##_x5_encoder = {                                \
++        .p.name         = #NAME "_x5",                                      \
++        CODEC_LONG_NAME("RDK X5 " LONGNAME " hardware encoder"),            \
++        .p.type         = AVMEDIA_TYPE_VIDEO,                               \
++        .p.id           = ID,                                               \
++        .p.priv_class   = &x5_##NAME##_enc_class,                           \
++        .p.capabilities = AV_CODEC_CAP_HARDWARE |                           \
++                          AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,            \
++        .p.pix_fmts     = FMTS,                                             \
++        .p.wrapper_name = "x5mm",                                           \
++        .priv_data_size = sizeof(X5EncCodecContext),                        \
++        .init           = x5enc_init,                                       \
++        FF_CODEC_ENCODE_CB(x5enc_encode2),                                  \
++        .close          = x5enc_close,                                      \
++        .defaults       = x5enc_defaults,                                   \
++        .color_ranges   = AVCOL_RANGE_MPEG | AVCOL_RANGE_JPEG,              \
++        .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,                        \
++    };
++
++#if CONFIG_H264_X5_ENCODER
++X5ENC(h264,  "H.264", AV_CODEC_ID_H264,  x5enc_options, x5enc_pix_fmts)
++#endif
++#if CONFIG_HEVC_X5_ENCODER
++X5ENC(hevc,  "HEVC",  AV_CODEC_ID_HEVC,  x5enc_options, x5enc_pix_fmts)
++#endif
++#if CONFIG_MJPEG_X5_ENCODER
++X5ENC(mjpeg, "MJPEG", AV_CODEC_ID_MJPEG, x5enc_mjpeg_options,
++      x5enc_mjpeg_pix_fmts)
++#endif
+diff --git a/libavcodec/x5enc.h b/libavcodec/x5enc.h
+new file mode 100644
+index 0000000..606c049
+--- /dev/null
++++ b/libavcodec/x5enc.h
+@@ -0,0 +1,52 @@
++/*
++ * RDK X5 hardware encoder core, shared by the h264_x5/hevc_x5/mjpeg_x5
++ * encoders and by the hardware-first path of libx264/libx265.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_X5ENC_H
++#define AVCODEC_X5ENC_H
++
++#include "avcodec.h"
++
++typedef struct X5Enc X5Enc;
++
++typedef struct X5EncParams {
++    int qp;         /* >= 0: constant QP, else CBR at avctx->bit_rate */
++    int quality;    /* MJPEG quality factor */
++    int profile;    /* FF_PROFILE_* or FF_PROFILE_UNKNOWN */
++    int gop;        /* I frame interval when avctx->gop_size <= 0 */
++} X5EncParams;
++
++/* 1 unless X5_CODEC_DISABLE is set to a non-zero value */
++int ff_x5_enabled(void);
++
++/*
++ * Open a hardware encoder for avctx (codec_id, size, pix_fmt, rate).
++ * Fills avctx->extradata when AV_CODEC_FLAG_GLOBAL_HEADER is set.
++ * Returns < 0 if the hardware cannot take this configuration.
++ */
++int ff_x5enc_open(AVCodecContext *avctx, const X5EncParams *par, X5Enc **enc);
++
++/* encode2-style: exactly one packet per frame, nothing on flush */
++int ff_x5enc_encode(AVCodecContext *avctx, X5Enc *enc, AVPacket *pkt,
++                    const AVFrame *frame, int *got_packet);
++
++void ff_x5enc_close(X5Enc **enc);
++
++#endif /* AVCODEC_X5ENC_H */
+-- 
+2.25.1
+

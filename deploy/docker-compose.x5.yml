@@ -1,0 +1,32 @@
+# RDK X5 overlay for immich's official docker-compose.yml (v3.4.2):
+#   docker compose -f docker-compose.yml -f docker-compose.x5.yml up -d
+#
+# immich-server: VPU/JPU video codecs, JPU/VPU + 2D GPU photo previews.
+# immich-machine-learning: face detection/recognition and CLIP image
+# encoding on the BPU (needs the BPU model packs in the model cache).
+# The vendor libraries and the VPU firmware are bind-mounted from the board
+# so that they always match its kernel drivers.
+services:
+  immich-server:
+    image: ${IMMICH_X5_SERVER_IMAGE:-immich-server:v3.4.2-x5}
+    devices:
+      - /dev/vpu:/dev/vpu
+      - /dev/jpu:/dev/jpu
+      - /dev/ion:/dev/ion
+      - /dev/nano2d:/dev/nano2d
+    volumes:
+      - /usr/hobot/lib/libmultimedia.so.1:/usr/local/lib/x5/libmultimedia.so.1:ro
+      - /usr/hobot/lib/libalog.so.1:/usr/local/lib/x5/libalog.so.1:ro
+      - /usr/hobot/lib/libhbmem.so.1:/usr/local/lib/x5/libhbmem.so.1:ro
+      - /usr/hobot/lib/firmware/libmm:/usr/local/lib/x5/firmware:ro
+
+  immich-machine-learning:
+    image: ${IMMICH_X5_ML_IMAGE:-immich-machine-learning:v3.4.2-bpu}
+    devices:
+      - /dev/bpu:/dev/bpu
+      - /dev/bpu_core0:/dev/bpu_core0
+      - /dev/ion:/dev/ion
+    environment:
+      # the BPU model packs use the model layout without a revision
+      # directory; "main" selects it (official compose sets v2)
+      MACHINE_LEARNING_MODEL_REVISION: main

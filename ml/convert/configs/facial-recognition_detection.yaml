@@ -1,0 +1,23 @@
+model_parameters:
+  onnx_model: onnx_fixed/face_det.onnx
+  march: bayes-e
+  working_dir: build/facial-recognition_detection
+  output_model_file_prefix: model
+input_parameters:
+  input_name: input.1
+  input_shape: 1x3x640x640
+  input_type_rt: rgb
+  input_layout_rt: NHWC
+  input_type_train: rgb
+  input_layout_train: NCHW
+  norm_type: data_mean_and_scale
+  mean_value: 127.5 127.5 127.5
+  scale_value: 0.0078125 0.0078125 0.0078125
+calibration_parameters:
+  cal_data_dir: calib/face_det
+  cal_data_type: float32
+  calibration_type: max
+  optimization: set_all_nodes_int16
+compiler_parameters:
+  compile_mode: latency
+  optimize_level: O3

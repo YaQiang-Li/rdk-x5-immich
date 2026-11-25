@@ -1,0 +1,484 @@
+From deecc2a006f6a882ca3695200ba8726f1ade4817 Mon Sep 17 00:00:00 2001
+From: "yaqiang.li" <yaqiang.li@d-robotics.cc>
+Date: Sun, 22 Nov 2026 22:01:10 +0800
+Subject: [PATCH] avfilter: scale/transpose on the RDK X5 2D GPU
+
+---
+ libavfilter/Makefile       |   1 +
+ libavfilter/vf_scale.c     |  13 ++
+ libavfilter/vf_transpose.c |  13 ++
+ libavfilter/x5n2d.c        | 343 +++++++++++++++++++++++++++++++++++++
+ libavfilter/x5n2d.h        |  37 ++++
+ 5 files changed, 407 insertions(+)
+ create mode 100644 libavfilter/x5n2d.c
+ create mode 100644 libavfilter/x5n2d.h
+
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 482e524..839590d 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -470,6 +470,7 @@ OBJS-$(CONFIG_ROBERTS_OPENCL_FILTER)         += vf_convolution_opencl.o opencl.o
+ OBJS-$(CONFIG_ROTATE_FILTER)                 += vf_rotate.o
+ OBJS-$(CONFIG_SAB_FILTER)                    += vf_sab.o
+ OBJS-$(CONFIG_SCALE_FILTER)                  += vf_scale.o scale_eval.o framesync.o
++OBJS-$(CONFIG_X5MM)                          += x5n2d.o
+ OBJS-$(CONFIG_SCALE_CUDA_FILTER)             += vf_scale_cuda.o scale_eval.o \
+                                                 vf_scale_cuda.ptx.o cuda/load_helper.o
+ OBJS-$(CONFIG_SCALE_NPP_FILTER)              += vf_scale_npp.o scale_eval.o
+diff --git a/libavfilter/vf_scale.c b/libavfilter/vf_scale.c
+index ac6a9a0..68e9e18 100644
+--- a/libavfilter/vf_scale.c
++++ b/libavfilter/vf_scale.c
+@@ -32,6 +32,10 @@
+ #include "formats.h"
+ #include "framesync.h"
+ #include "scale_eval.h"
++#include "config.h"
++#if CONFIG_X5MM
++#include "x5n2d.h"
++#endif
+ #include "video.h"
+ #include "libavutil/eval.h"
+ #include "libavutil/imgutils_internal.h"
+@@ -1041,6 +1045,15 @@ scale:
+               (int64_t)in->sample_aspect_ratio.den * outlink->w * link->h,
+               INT_MAX);
+ 
++#if CONFIG_X5MM
++    /* same format, no range/matrix change: let the 2D GPU resize it */
++    if (scale->interlaced <= 0 && in->format == out->format &&
++        in->color_range == out->color_range &&
++        in->colorspace == out->colorspace &&
++        ff_x5n2d_process(ctx, out, in, 0) == 0) {
++        ret = 0;
++    } else
++#endif
+     if (scale->interlaced>0 || (scale->interlaced<0 &&
+         (in->flags & AV_FRAME_FLAG_INTERLACED))) {
+         ret = scale_field(scale, out, in, 0);
+diff --git a/libavfilter/vf_transpose.c b/libavfilter/vf_transpose.c
+index d283624..a942c65 100644
+--- a/libavfilter/vf_transpose.c
++++ b/libavfilter/vf_transpose.c
+@@ -37,6 +37,10 @@
+ #include "avfilter.h"
+ #include "filters.h"
+ #include "formats.h"
++#include "config.h"
++#if CONFIG_X5MM
++#include "x5n2d.h"
++#endif
+ #include "video.h"
+ #include "transpose.h"
+ 
+@@ -355,6 +359,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+         out->sample_aspect_ratio.den = in->sample_aspect_ratio.num;
+     }
+ 
++#if CONFIG_X5MM
++    /* plain 90 degree rotations: on the 2D GPU */
++    if ((s->dir == TRANSPOSE_CLOCK || s->dir == TRANSPOSE_CCLOCK) &&
++        ff_x5n2d_process(ctx, out, in,
++                         s->dir == TRANSPOSE_CLOCK ? 90 : 270) == 0) {
++        av_frame_free(&in);
++        return ff_filter_frame(outlink, out);
++    }
++#endif
+     td.in = in, td.out = out;
+     ff_filter_execute(ctx, filter_slice, &td, NULL,
+                       FFMIN(outlink->h, ff_filter_get_nb_threads(ctx)));
+diff --git a/libavfilter/x5n2d.c b/libavfilter/x5n2d.c
+new file mode 100644
+index 0000000..e421e63
+--- /dev/null
++++ b/libavfilter/x5n2d.c
+@@ -0,0 +1,343 @@
++/*
++ * RDK X5 2D GPU (nano2D) acceleration for the scale and transpose filters
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * The libraries are loaded with dlopen() on first use, so the filters work
++ * unchanged on machines without them. Frames are copied into cached,
++ * physically contiguous hbmem NV12 buffers that are wrapped for the GPU;
++ * the GPU driver has a single context, so every operation runs under a
++ * file lock shared with other users on the same machine.
++ *
++ * Measured on the X5 (1080p NV12): resize to 720p 7.4 ms, 90 degree
++ * rotation of 720p 3.4 ms, about 50 dB against swscale lanczos.
++ * X5_CODEC_DISABLE=1 or X5_N2D_FILTERS=0 keeps the filters on swscale.
++ */
++
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/file.h>
++#include <unistd.h>
++
++#include <GC820/nano2D.h>
++#include <hb_mem_mgr.h>
++
++#include "libavutil/common.h"
++#include "libavutil/frame.h"
++#include "libavutil/log.h"
++#include "x5n2d.h"
++
++#define X5N2D_LOCK "/tmp/x5thumb.n2d.lock"
++
++enum { BUF_SRC, BUF_MID, BUF_DST, NB_BUFS };
++
++struct x5buf {
++    int w, h;
++    hb_mem_graphic_buf_t hb;
++    n2d_buffer_t n2d;
++};
++
++static struct {
++    pthread_mutex_t mutex;
++    int state;                          /* 0 untried, 1 ready, -1 off */
++    int lockfd;
++    unsigned char ylut[256], clut[256]; /* full -> limited range */
++    unsigned char yinv[256], cinv[256]; /* limited -> full range */
++    struct x5buf buf[NB_BUFS];
++    n2d_error_t (*open)(void);
++    n2d_error_t (*switch_device)(n2d_device_id_t);
++    n2d_error_t (*switch_core)(n2d_core_id_t);
++    n2d_error_t (*wrap)(n2d_user_memory_desc_t *, n2d_uintptr_t *);
++    n2d_error_t (*map)(n2d_buffer_t *);
++    n2d_error_t (*free_buf)(n2d_buffer_t *);
++    n2d_error_t (*set)(n2d_state_config_t *);
++    n2d_error_t (*filterblit)(n2d_buffer_t *, n2d_rectangle_t *,
++                              n2d_rectangle_t *, n2d_buffer_t *,
++                              n2d_rectangle_t *, n2d_blend_t);
++    n2d_error_t (*blit)(n2d_buffer_t *, n2d_rectangle_t *, n2d_buffer_t *,
++                        n2d_rectangle_t *, n2d_blend_t);
++    n2d_error_t (*commit)(void);
++    int32_t (*mem_open)(void);
++    int32_t (*alloc)(int32_t, int32_t, int32_t, int64_t, int32_t, int32_t,
++                     hb_mem_graphic_buf_t *);
++    int32_t (*mem_free)(int32_t);
++    int32_t (*flush)(uint64_t, uint64_t);
++    int32_t (*invalidate)(uint64_t, uint64_t);
++} g = { .mutex = PTHREAD_MUTEX_INITIALIZER };
++
++static int load(void)
++{
++    void *n2d, *mem;
++    const char *e = getenv("X5_CODEC_DISABLE");
++    int i;
++
++    if (e && *e && strcmp(e, "0"))
++        return -1;
++    /* the 2D GPU may be wanted for other users only (e.g. photos) */
++    e = getenv("X5_N2D_FILTERS");
++    if (e && !strcmp(e, "0"))
++        return -1;
++    n2d = dlopen("libNano2D.so", RTLD_NOW);
++    mem = dlopen("libhbmem.so.1", RTLD_NOW);
++    if (!n2d || !mem || access("/dev/nano2d", R_OK | W_OK))
++        return -1;
++#define SYM(lib, f, name) if (!(*(void **)&g.f = dlsym(lib, name))) return -1
++    SYM(n2d, open, "n2d_open");
++    SYM(n2d, switch_device, "n2d_switch_device");
++    SYM(n2d, switch_core, "n2d_switch_core");
++    SYM(n2d, wrap, "n2d_wrap");
++    SYM(n2d, map, "n2d_map");
++    SYM(n2d, free_buf, "n2d_free");
++    SYM(n2d, set, "n2d_set");
++    SYM(n2d, filterblit, "n2d_filterblit");
++    SYM(n2d, blit, "n2d_blit");
++    SYM(n2d, commit, "n2d_commit");
++    SYM(mem, mem_open, "hb_mem_module_open");
++    SYM(mem, alloc, "hb_mem_alloc_graph_buf");
++    SYM(mem, mem_free, "hb_mem_free_buf");
++    SYM(mem, flush, "hb_mem_flush_buf_with_vaddr");
++    SYM(mem, invalidate, "hb_mem_invalidate_buf_with_vaddr");
++#undef SYM
++    g.lockfd = open(X5N2D_LOCK, O_CREAT | O_RDWR, 0666);
++    if (g.lockfd < 0 || g.mem_open() < 0)
++        return -1;
++    if (flock(g.lockfd, LOCK_EX))
++        return -1;
++    i = N2D_IS_ERROR(g.open());
++    if (!i) {
++        g.switch_device(N2D_DEVICE_0);
++        g.switch_core(N2D_CORE_0);
++    }
++    flock(g.lockfd, LOCK_UN);
++    if (i)
++        return -1;
++    for (i = 0; i < 256; i++) {
++        g.ylut[i] = (i * 219 + 127) / 255 + 16;
++        g.clut[i] = ((i - 128) * 224 + (i < 128 ? -127 : 127)) / 255 + 128;
++        g.yinv[i] = av_clip_uint8(((i - 16) * 255 + 109) / 219);
++        g.cinv[i] = av_clip_uint8(((i - 128) * 255 +
++                                   (i < 128 ? -112 : 112)) / 224 + 128);
++    }
++    return 0;
++}
++
++static void buf_release(struct x5buf *b)
++{
++    if (!b->w)
++        return;
++    g.free_buf(&b->n2d);
++    g.mem_free(b->hb.fd[0]);
++    memset(b, 0, sizeof(*b));
++}
++
++/* a w x h NV12 buffer usable by both the CPU (cached) and the GPU */
++static int buf_get(struct x5buf *b, int w, int h)
++{
++    n2d_user_memory_desc_t desc = { 0 };
++    n2d_uintptr_t handle;
++    int stride = FFALIGN(w, 64);
++
++    if (b->w == w && b->h == h)
++        return 0;
++    buf_release(b);
++    if (g.alloc(w, h, MEM_PIX_FMT_NV12, HB_MEM_USAGE_CPU_READ_OFTEN |
++                HB_MEM_USAGE_CPU_WRITE_OFTEN | HB_MEM_USAGE_CACHED |
++                HB_MEM_USAGE_GRAPHIC_CONTIGUOUS_BUF, stride, h, &b->hb))
++        return -1;
++    /* the GPU buffer is one region: UV must follow Y */
++    if (b->hb.stride != stride ||
++        b->hb.phys_addr[1] != b->hb.phys_addr[0] + (uint64_t)stride * h) {
++        g.mem_free(b->hb.fd[0]);
++        return -1;
++    }
++    b->n2d.width     = w;
++    b->n2d.height    = h;
++    b->n2d.format    = N2D_NV12;
++    b->n2d.orientation = N2D_0;
++    b->n2d.srcType   = N2D_SOURCE_DEFAULT;
++    b->n2d.tiling    = N2D_LINEAR;
++    b->n2d.cacheMode = N2D_CACHE_128;
++    b->n2d.alignedw  = stride;
++    b->n2d.alignedh  = h;
++    b->n2d.stride    = stride;
++    desc.flag     = N2D_WRAP_FROM_USERMEMORY;
++    desc.physical = b->hb.phys_addr[0];
++    desc.size     = (n2d_size_t)stride * h * 3 / 2;
++    if (N2D_IS_ERROR(g.wrap(&desc, &handle))) {
++        g.mem_free(b->hb.fd[0]);
++        return -1;
++    }
++    b->n2d.handle = handle;
++    if (N2D_IS_ERROR(g.map(&b->n2d))) {
++        g.free_buf(&b->n2d);
++        g.mem_free(b->hb.fd[0]);
++        return -1;
++    }
++    b->w = w;
++    b->h = h;
++    return 0;
++}
++
++static void lut_copy(uint8_t *d, const uint8_t *s, int n, const uint8_t *lut)
++{
++    int i;
++
++    if (!lut) {
++        memcpy(d, s, n);
++        return;
++    }
++    for (i = 0; i < n; i++)
++        d[i] = lut[s[i]];
++}
++
++static void frame_to_buf(struct x5buf *b, const AVFrame *f, int full)
++{
++    hb_mem_graphic_buf_t *hb = &b->hb;
++    int x, y, cw = f->width / 2;
++
++    for (y = 0; y < f->height; y++)
++        lut_copy(hb->virt_addr[0] + (size_t)y * hb->stride,
++                 f->data[0] + (size_t)y * f->linesize[0], f->width,
++                 full ? g.ylut : NULL);
++    for (y = 0; y < f->height / 2; y++) {
++        uint8_t *d = hb->virt_addr[1] + (size_t)y * hb->stride;
++        const uint8_t *u = f->data[1] + (size_t)y * f->linesize[1];
++        const uint8_t *v = f->data[2] + (size_t)y * f->linesize[2];
++
++        if (full)
++            for (x = 0; x < cw; x++) {
++                d[2 * x]     = g.clut[u[x]];
++                d[2 * x + 1] = g.clut[v[x]];
++            }
++        else
++            for (x = 0; x < cw; x++) {
++                d[2 * x]     = u[x];
++                d[2 * x + 1] = v[x];
++            }
++    }
++    g.flush((uint64_t)hb->virt_addr[0], (uint64_t)hb->stride * f->height);
++    g.flush((uint64_t)hb->virt_addr[1],
++            (uint64_t)hb->stride * f->height / 2);
++}
++
++static void buf_to_frame(AVFrame *f, struct x5buf *b, int full)
++{
++    hb_mem_graphic_buf_t *hb = &b->hb;
++    int x, y, cw = f->width / 2;
++
++    g.invalidate((uint64_t)hb->virt_addr[0],
++                 (uint64_t)hb->stride * f->height);
++    g.invalidate((uint64_t)hb->virt_addr[1],
++                 (uint64_t)hb->stride * f->height / 2);
++    for (y = 0; y < f->height; y++)
++        lut_copy(f->data[0] + (size_t)y * f->linesize[0],
++                 hb->virt_addr[0] + (size_t)y * hb->stride, f->width,
++                 full ? g.yinv : NULL);
++    for (y = 0; y < f->height / 2; y++) {
++        const uint8_t *s = hb->virt_addr[1] + (size_t)y * hb->stride;
++        uint8_t *u = f->data[1] + (size_t)y * f->linesize[1];
++        uint8_t *v = f->data[2] + (size_t)y * f->linesize[2];
++
++        for (x = 0; x < cw; x++) {
++            u[x] = full ? g.cinv[s[2 * x]] : s[2 * x];
++            v[x] = full ? g.cinv[s[2 * x + 1]] : s[2 * x + 1];
++        }
++    }
++}
++
++static int supported(const AVFrame *f)
++{
++    return (f->format == AV_PIX_FMT_YUV420P ||
++            f->format == AV_PIX_FMT_YUVJ420P) &&
++           !((f->width | f->height) & 1) && f->width >= 64 &&
++           f->height >= 64 && f->width <= 8192 && f->height <= 8192 &&
++           !(f->flags & AV_FRAME_FLAG_INTERLACED);
++}
++
++int ff_x5n2d_process(void *logctx, AVFrame *out, const AVFrame *in, int rot)
++{
++    n2d_rectangle_t sr, dr;
++    struct x5buf *src = &g.buf[BUF_SRC], *dst = &g.buf[BUF_DST];
++    int full, ret = AVERROR(ENOSYS), swap = rot == 90 || rot == 270;
++
++    if (!supported(in) || !supported(out) || in->format != out->format)
++        return ret;
++    /* rotation only, or scaling only (the filters never ask for both) */
++    if (rot && (out->width != (swap ? in->height : in->width) ||
++                out->height != (swap ? in->width : in->height)))
++        return ret;
++    full = in->format == AV_PIX_FMT_YUVJ420P ||
++           in->color_range == AVCOL_RANGE_JPEG;
++
++    pthread_mutex_lock(&g.mutex);
++    if (!g.state) {
++        g.state = load() ? -1 : 1;
++        av_log(logctx, g.state > 0 ? AV_LOG_INFO : AV_LOG_VERBOSE,
++               "RDK X5 2D GPU %s\n", g.state > 0 ? "in use" :
++               "not available, using software");
++    }
++    if (g.state < 0)
++        goto out;
++    if (buf_get(src, in->width, in->height) ||
++        buf_get(dst, out->width, out->height))
++        goto out;
++    frame_to_buf(src, in, full);
++    if (flock(g.lockfd, LOCK_EX))
++        goto out;
++    if (rot) {
++        n2d_buffer_t s = src->n2d;
++
++        /* n2d orientation turns the source counter-clockwise */
++        s.orientation = rot == 90 ? N2D_270 : rot == 180 ? N2D_180 : N2D_90;
++        dr = (n2d_rectangle_t){ 0, 0, out->width, out->height };
++        ret = N2D_IS_ERROR(g.blit(&dst->n2d, &dr, &s, N2D_NULL,
++                                  N2D_BLEND_NONE));
++    } else {
++        n2d_state_config_t c = { .state = N2D_SET_FILTER_TYPE,
++                                 .config.filterType = N2D_FILTER_BILINEAR };
++
++        g.set(&c);
++        memset(&c, 0, sizeof(c));
++        c.state = N2D_SET_CSC;
++        c.config.csc.cscMode = in->colorspace == AVCOL_SPC_BT709 ?
++                               N2D_CSC_BT709 : N2D_CSC_BT601;
++        c.config.csc.userCSCMode = N2D_CSC_YUV_TO_RGB;
++        g.set(&c);
++        c.config.csc.userCSCMode = N2D_CSC_RGB_TO_YUV;
++        g.set(&c);
++        sr = (n2d_rectangle_t){ 0, 0, in->width, in->height };
++        dr = (n2d_rectangle_t){ 0, 0, out->width, out->height };
++        ret = N2D_IS_ERROR(g.filterblit(&dst->n2d, &dr, N2D_NULL, &src->n2d,
++                                        &sr, N2D_BLEND_NONE));
++    }
++    if (!ret)
++        ret = N2D_IS_ERROR(g.commit());
++    flock(g.lockfd, LOCK_UN);
++    if (ret) {
++        ret = AVERROR_EXTERNAL;
++        goto out;
++    }
++    buf_to_frame(out, dst, full);
++out:
++    pthread_mutex_unlock(&g.mutex);
++    return ret;
++}
+diff --git a/libavfilter/x5n2d.h b/libavfilter/x5n2d.h
+new file mode 100644
+index 0000000..531f248
+--- /dev/null
++++ b/libavfilter/x5n2d.h
+@@ -0,0 +1,37 @@
++/*
++ * RDK X5 2D GPU (nano2D) acceleration for the scale and transpose filters
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVFILTER_X5N2D_H
++#define AVFILTER_X5N2D_H
++
++#include "libavutil/frame.h"
++
++/**
++ * Resize in into out (rot == 0) or rotate it clockwise by rot degrees
++ * (90, 180, 270; out must have the rotated size) on the RDK X5 2D GPU.
++ * Only 8-bit 4:2:0 planar progressive frames of the same format.
++ * X5_CODEC_DISABLE=1 or X5_N2D_FILTERS=0 turns it off.
++ *
++ * @return 0 on success, AVERROR(ENOSYS) when not applicable or no GPU
++ *         (use the software path), another negative error on failure
++ */
++int ff_x5n2d_process(void *logctx, AVFrame *out, const AVFrame *in, int rot);
++
++#endif /* AVFILTER_X5N2D_H */
+-- 
+2.25.1
+
